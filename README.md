@@ -19,6 +19,88 @@ An open, deployable remote monitoring gateway that reads live data from the Libr
 Solar BMS, publishes it to a standard MQTT layer, and makes it visible in the
 tools operators and the community already use.
 
+## Team Haske solution
+
+A working gateway built on the schema in [`docs/mqtt-schema.md`](docs/mqtt-schema.md). It runs the real BMS firmware on a simulated battery (the **firmware rig**); real-hardware transport is the next step.
+
+```mermaid
+flowchart LR
+    rig["firmware-rig<br/>real firmware on a simulated battery"]
+    relay["wifi-sim<br/>(relay)"]
+    mqtt{{"Mosquitto<br/>MQTT broker"}}
+    bridge["bms-bridge"]
+    ha["Home Assistant"]
+    ing["mpm-ingestor"]
+    mpm["MicroPowerManager"]
+
+    rig -- "#mLive (TCP, like a UART)" --> relay
+    relay -- "meas, info, status" --> mqtt
+    mqtt --> bridge
+    bridge -- "summary, event" --> mqtt
+    mqtt -- "full stream" --> ha
+    mqtt -- "summary, event" --> ing
+    ing --> mpm
+```
+
+| Service | What it does | Host port |
+|---------|--------------|-----------|
+| `mosquitto` | MQTT broker (the single hub) | 1883 |
+| `firmware-rig` | The real Libre Solar firmware (Zephyr `native_sim`) fed by a battery model; serves its `#mLive` line on TCP 3333; scenarios `normal`, `charging`, `discharging`, `low_soc`, `cell_drift`, `overheat`, `cloudy`, `overcurrent`, `undervoltage`, `instant_recovery` ([readme](services/firmware-rig/readme.md)) | 8010 (3333) |
+| `wifi-sim` | The relay: reads the serial `#mLive` line, publishes `meas`, `info` and status over MQTT. Forwards only; reference for the real ESP32/Cicada relay | 8013 |
+| `bms-simulator` | Pure-Python fallback without the firmware (`--profile sim`) | 8014 |
+| `bms-bridge` | Derives health score, state of health and fault events; publishes `summary` and `event` topics; Home Assistant discovery | 8011 |
+| `homeassistant` | Receives the full stream as auto-discovered entities | 8123 |
+| `mpm-ingestor` | Sends low-frequency summaries and fault events to MPM (persistent MQTT session, on-disk outbox with retry) | 8012 |
+
+MicroPowerManager only receives the low-frequency summary and fault events, shown as a **Battery Health** page (list plus detail page with a fault log and recommended actions). Home Assistant gets the full stream.
+
+Each service has its own readme next to its code: [`firmware-rig`](services/firmware-rig/readme.md), [`bms-bridge`](services/bms-bridge/readme.md), [`mpm-ingestor`](services/mpm-ingestor/readme.md).
+
+### Quick start (firmware rig, Home Assistant)
+
+Requires Docker. The first build compiles the real firmware (several GB download, a few minutes) and is Linux/amd64 only, so on Apple Silicon it runs under emulation. Note this does not include MPM, to include MPM see [Add MPM below](#add-micropowermanager)
+
+```bash
+cp .env.example .env
+docker compose up --build -d
+```
+
+- Home Assistant: http://localhost:8123 (the BMS device appears automatically).
+- Check the rig: `curl localhost:8010/health` and `curl localhost:8010/state` (the model's hidden truth).
+- Trigger a fault: `curl -X POST http://localhost:8010/scenario/overheat`, then `curl -X POST http://localhost:8010/scenario/normal` to reset. Scenarios: `normal`, `charging`, `discharging`, `low_soc`, `cell_drift`, `overheat`, `cloudy`, `overcurrent`, `undervoltage`, `instant_recovery`. They change the simulated battery only; the firmware reacts as it would to real readings.
+- Pure-Python fallback without the firmware: `RELAY_SOURCE=http://bms-simulator:8000/live docker compose --profile sim up --build -d`.
+
+**Time speed.** `SPEED` runs the firmware's battery faster than real time and also sets the bridge `TIME_SCALE`, so cycle counting stays consistent. `docker-compose.yml` defaults to `60` so faults and summaries show up within minutes, but at `SPEED > 1` the state of charge starts at 0 until the firmware's first full-charge reset. `.env.example` sets `SPEED=60` (real time, SoC initialised from the cells at boot). A real BMS needs `SPEED=1`.
+
+**Real hardware.** Point the relay at a BMS C1's UART instead of the rig: `RELAY_SOURCE=serial:COM5` (or `/dev/ttyUSB0`). `tcp://`, `file:` and `http://.../live` sources are also supported.
+
+| Port | Service |
+|------|---------|
+| 1883 | Mosquitto |
+| 3333 | Firmware `#mLive` line (TCP, UART stand-in) |
+| 8010 / 8011 / 8012 / 8013 / 8014 | firmware-rig / bms-bridge / mpm-ingestor / wifi-sim / bms-simulator APIs |
+| 8123 | Home Assistant |
+
+`docker-compose.dev.yml` adds a `dev` container (only Docker needed on the host) on the same network; see [`docs/docker-only.md`](docs/docker-only.md).
+
+### Add MicroPowerManager
+
+One command builds MPM with our plugin, starts it next to the gateway and wires the API key automatically:
+
+```bash
+docker compose --profile mpm up --build -d
+```
+
+Then open http://localhost:8001 (login defaults in `.env.example`). Details, the first-build time and the manual route for developing the plugin: [`integrations/micropowermanager/README.md`](integrations/micropowermanager/README.md). Never commit a real key.
+
+### Status
+
+- Done: schema, firmware rig (real firmware on a simulated battery, closed loop with the FET state), serial/TCP relay, bridge, Home Assistant integration, MPM ingestion and Battery Health page. Verified: an overheat scenario raised `CHG_OVERTEMP` and `DIS_OVERTEMP` in the real firmware and the events reached the MPM ingestor.
+- Next: test against a real BMS C1 over serial, SMS alerts through MPM, Prospect adapter, persisting the cycle count across restarts, the A2 Cicada relay (`services/cicada-relay-sim` is a placeholder).
+- Known limits: state of health is a simple cycle-model estimate; the rig models chip protections but not chip cell balancing, so it validates message formats and firmware behaviour, not protection hardware; the broker is anonymous (demo only).
+
+---
+
 ## Abstract and goal
 
 The Libre Solar BMS is a capable open-source battery management system, but once

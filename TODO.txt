@@ -1,0 +1,8 @@
+High Priority
+
+
+Nice to have
+5. Real BMC C1 tests over serial
+6. SMS alerts through MPM
+7. Prospect adapter
+8. A2 Cicada relay

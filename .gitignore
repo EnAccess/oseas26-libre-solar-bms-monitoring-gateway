@@ -1,0 +1,14 @@
+.virtualenv
+.venv
+**.venv
+**__pycache__**
+__pycache__
+**/__pycache__/
+
+# Home Assistant generated state (keep only the readme)
+infra/homeassistant/config/*
+!infra/homeassistant/config/readme.md
+.env
+
+# Talk slides (local only)
+presentation/

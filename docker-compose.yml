@@ -1,0 +1,254 @@
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2.0.20
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./infra/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto-data:/mosquitto/data
+    healthcheck:
+      # publishing succeeds only if the broker accepts connections
+      test: ["CMD-SHELL", "mosquitto_pub -h localhost -t healthcheck/ping -m ok -q 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  firmware-rig:
+    # The REAL Libre Solar firmware (Zephyr native_sim) on a simulated battery. Its #mLive line is served
+    # on TCP 3333, exactly where the relay reads a real BMS C1's UART.
+    build: ./services/firmware-rig
+    environment:
+      SPEED: ${SPEED:-60}              # 1 = real time; higher = faster battery (SoC then starts at 0, see readme)
+      SCENARIO: ${SCENARIO:-normal}
+      CAPACITY_AH: ${CAPACITY_AH:-50}
+      CELLS: ${CELLS:-8}
+    ports:
+      - "8010:8000"
+      - "3333:3333"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+
+  bms-simulator:
+    # Pure-Python fallback without the firmware: `docker compose --profile sim up` and RELAY_SOURCE=http://bms-simulator:8000/live
+    profiles: ["sim"]
+    build: ./services/bms-simulator
+    environment:
+      MQTT_HOST: mosquitto
+      MQTT_PORT: "1883"
+      MQTT_ENABLED: "false"       # the gateway publishes, the simulator only plays the BMS
+      PUBLISH_INTERVAL_S: "5"
+      SPEED: "60"
+      SCENARIO: normal
+    ports:
+      - "8014:8000"          # 8000/8001 are MicroPowerManager's backend/frontend
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    healthcheck:
+      # the slim image has no curl, but it has Python
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  wifi-sim:
+    build: ./services/wifi-sim
+    environment:
+      SOURCE: ${RELAY_SOURCE:-tcp://firmware-rig:3333}   # the rig; a real C1 would be serial:COM5
+      MQTT_HOST: mosquitto
+      DEVICE_ID: ${DEVICE_ID:-haske-bms-001}
+      PUBLISH_INTERVAL_S: ${PUBLISH_INTERVAL_S:-5}
+      CAPACITY_AH: ${CAPACITY_AH:-50}
+    ports:
+      - "8013:8000"
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  bms-bridge:
+    # The relay only forwards `meas`; the bridge derives `summary` and `event` for MPM (packages/bms-health).
+    build:
+      context: .
+      dockerfile: services/bms-bridge/Dockerfile
+    environment:
+      MQTT_HOST: mosquitto
+      MQTT_PORT: "1883"
+      SUMMARY_INTERVAL_S: ${SUMMARY_INTERVAL_S:-30}   # real BMS: 900
+      TIME_SCALE: ${SPEED:-60}      # must equal the rig SPEED; real BMS: 1
+    ports:
+      - "8011:8001"
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8001', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  homeassistant:
+    image: ghcr.io/home-assistant/home-assistant:stable
+    ports:
+      - "8123:8123"
+    volumes:
+      - ha-config:/config
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    restart: unless-stopped
+
+  mpm-ingestor:
+    build: ./services/mpm-ingestor
+    environment:
+      MQTT_HOST: mosquitto
+      MQTT_PORT: "1883"
+      MPM_BASE_URL: ${MPM_BASE_URL:-http://host.docker.internal:8000}
+      MPM_API_KEY: ${MPM_API_KEY:-}
+      MPM_API_KEY_FILE: /shared/mpm_api_key
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "8012:8002"
+    volumes:
+      - mpm-ingestor-data:/data
+      - mpm-shared:/shared:ro
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ---- MicroPowerManager with the Libre Solar BMS plugin: docker compose --profile mpm up --build -d ----
+  mpm-mysql:
+    profiles: ["mpm"]
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: micro_power_manager
+      MYSQL_ROOT_PASSWORD: ${MPM_DB_PASSWORD:-mpm-demo-db-password}
+    volumes:
+      - mpm-mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      start_period: 20s
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    restart: unless-stopped
+
+  mpm-redis:
+    profiles: ["mpm"]
+    image: redis:7
+    restart: unless-stopped
+
+  mpm-backend:
+    profiles: ["mpm"]
+    image: libre-solar-mpm-backend
+    # Only this service builds the shared image. The worker and scheduler reuse it (pull_policy: never), because
+    # building the same tag from three services in parallel races on a cold cache ("image already exists").
+    build:
+      context: .
+      dockerfile: integrations/micropowermanager/docker/Dockerfile
+      target: backend
+      args:
+        MPM_REF: ${MPM_REF:-d6632495586a9dc5c4f71decdec33f5f960701b8}
+    env_file: ./integrations/micropowermanager/docker/backend.env
+    environment:
+      DB_PASSWORD: ${MPM_DB_PASSWORD:-mpm-demo-db-password}
+    volumes:
+      - mpm-storage:/var/www/html/storage
+    ports:
+      - "8000:80"
+    depends_on:
+      mpm-mysql: {condition: service_healthy}
+      mpm-redis: {condition: service_started}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/up"]
+      start_period: 300s          # first boot runs central and tenant migrations
+      interval: 15s
+      timeout: 10s
+      retries: 40
+    restart: unless-stopped
+
+  mpm-queue-worker:
+    profiles: ["mpm"]
+    image: libre-solar-mpm-backend
+    pull_policy: never
+    entrypoint: ["/usr/local/bin/entrypoint-queue-worker.sh"]
+    env_file: ./integrations/micropowermanager/docker/backend.env
+    environment:
+      DB_PASSWORD: ${MPM_DB_PASSWORD:-mpm-demo-db-password}
+    volumes:
+      - mpm-storage:/var/www/html/storage
+    depends_on:
+      mpm-backend: {condition: service_healthy}
+    restart: unless-stopped
+
+  mpm-scheduler:
+    profiles: ["mpm"]
+    image: libre-solar-mpm-backend
+    pull_policy: never
+    entrypoint: ["/usr/local/bin/entrypoint-scheduler.sh"]
+    env_file: ./integrations/micropowermanager/docker/backend.env
+    environment:
+      DB_PASSWORD: ${MPM_DB_PASSWORD:-mpm-demo-db-password}
+    volumes:
+      - mpm-storage:/var/www/html/storage
+    depends_on:
+      mpm-backend: {condition: service_healthy}
+    restart: unless-stopped
+
+  mpm-frontend:
+    profiles: ["mpm"]
+    build:
+      context: .
+      dockerfile: integrations/micropowermanager/docker/Dockerfile
+      target: frontend
+      args:
+        MPM_REF: ${MPM_REF:-d6632495586a9dc5c4f71decdec33f5f960701b8}
+    environment:
+      MPM_ENV: development
+      MPM_BACKEND_URL: http://localhost:8000       # the browser calls the backend on the host port
+    ports:
+      - "8001:80"
+    restart: unless-stopped
+
+  mpm-bootstrap:
+    # One-shot: creates the company, the owner and an API key, and leaves the key in the shared volume.
+    profiles: ["mpm"]
+    image: python:3.12-slim
+    command: ["python", "/bootstrap.py"]
+    environment:
+      MPM_URL: http://mpm-backend
+      MPM_OWNER_EMAIL: ${MPM_OWNER_EMAIL:-owner@example.com}
+      MPM_OWNER_PASSWORD: ${MPM_OWNER_PASSWORD:-demo-password-1}
+      MPM_KEY_FILE: /shared/mpm_api_key
+    volumes:
+      - ./integrations/micropowermanager/docker/bootstrap.py:/bootstrap.py:ro
+      - mpm-shared:/shared
+    depends_on:
+      mpm-backend: {condition: service_healthy}
+    restart: "no"
+
+volumes:
+  mosquitto-data:
+  ha-config:
+  mpm-ingestor-data:
+  mpm-mysql-data:
+  mpm-storage:
+  mpm-shared:

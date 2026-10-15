@@ -1,0 +1,173 @@
+<?php
+
+namespace App\Plugins\LibreSolarBms\Services;
+
+use App\Plugins\LibreSolarBms\Models\LibreSolarBmsDevice;
+use App\Plugins\LibreSolarBms\Models\LibreSolarBmsEvent;
+use App\Plugins\LibreSolarBms\Models\LibreSolarBmsSummary;
+use Illuminate\Contracts\Pagination\LengthAwarePaginator;
+use Illuminate\Database\Eloquent\Collection;
+use Illuminate\Support\Carbon;
+
+class LibreSolarBmsService {
+    public function __construct(
+        private LibreSolarBmsDevice $device,
+        private LibreSolarBmsEvent $event,
+        private LibreSolarBmsSummary $summaryModel,
+    ) {}
+
+    /**
+     * @param array<string, mixed> $summary
+     */
+    public function recordSummary(array $summary): LibreSolarBmsDevice {
+        $battery = $this->findOrRegister($summary['device_id']);
+        $reportedAt = Carbon::parse($summary['ts']);
+
+        // Every summary goes to history first (idempotent), whatever its age.
+        $this->summaryModel->newQuery()->firstOrCreate(
+            ['summary_key' => sha1($summary['device_id'].'|'.$summary['ts'])],
+            [
+                'libre_solar_bms_device_id' => $battery->id,
+                'reported_at' => $reportedAt,
+                'state' => $summary['state'] ?? null,
+                'soc_pct' => $summary['soc_pct'] ?? null,
+                'soh_pct' => $summary['soh_pct'] ?? null,
+                'cycles' => $summary['cycles'] ?? null,
+                'pack_voltage_v' => $summary['pack_voltage_v'] ?? null,
+                'imbalance_v' => $summary['imbalance_v'] ?? null,
+                'max_temp_c' => $summary['max_temp_c'] ?? null,
+                'health' => $summary['health'],
+                'health_score' => $summary['health_score'] ?? null,
+                'health_reasons' => $summary['health_reasons'] ?? [],
+                'active_faults' => $summary['active_faults'] ?? [],
+            ],
+        );
+
+        // The ingestor replays queued data after an outage, so an older summary can arrive late.
+        if ($battery->summary_at !== null && $reportedAt->lessThan($battery->summary_at)) {
+            return $battery;
+        }
+
+        $battery->fill([
+            'state' => $summary['state'] ?? null,
+            'soc_pct' => $summary['soc_pct'] ?? null,
+            'soh_pct' => $summary['soh_pct'] ?? null,
+            'cycles' => $summary['cycles'] ?? null,
+            'pack_voltage_v' => $summary['pack_voltage_v'] ?? null,
+            'imbalance_v' => $summary['imbalance_v'] ?? null,
+            'max_temp_c' => $summary['max_temp_c'] ?? null,
+            'health' => $summary['health'],
+            'health_score' => $summary['health_score'] ?? null,
+            'health_reasons' => $summary['health_reasons'] ?? [],
+            'active_faults' => $summary['active_faults'] ?? [],
+            'summary_at' => $reportedAt,
+            'last_seen_at' => $reportedAt,
+        ])->save();
+
+        return $battery;
+    }
+
+    /**
+     * Idempotent: the same event delivered twice is stored once.
+     *
+     * @param list<array<string, mixed>> $events
+     *
+     * @return array{accepted: int, duplicates: int}
+     */
+    public function recordEvents(array $events): array {
+        $accepted = 0;
+        $duplicates = 0;
+
+        foreach ($events as $incoming) {
+            $battery = $this->findOrRegister($incoming['device_id']);
+            $fault = $incoming['fault'] ?? null;
+            $stored = $this->event->newQuery()->firstOrCreate(
+                ['event_key' => sha1(implode('|', [$incoming['device_id'], $incoming['ts'], $incoming['type'], $fault]))],
+                [
+                    'libre_solar_bms_device_id' => $battery->id,
+                    'occurred_at' => Carbon::parse($incoming['ts']),
+                    'type' => $incoming['type'],
+                    'fault' => $fault,
+                    'severity' => $incoming['severity'],
+                    'message' => $incoming['message'],
+                    'action' => $incoming['action'] ?? null,
+                ],
+            );
+            $stored->wasRecentlyCreated ? $accepted++ : $duplicates++;
+        }
+
+        return ['accepted' => $accepted, 'duplicates' => $duplicates];
+    }
+
+    /**
+     * @return Collection<int, LibreSolarBmsDevice>
+     */
+    public function listBatteries(): Collection {
+        return $this->device->newQuery()->orderBy('name')->get();
+    }
+
+    public function getBattery(int $batteryId): LibreSolarBmsDevice {
+        return $this->device->newQuery()->findOrFail($batteryId);
+    }
+
+    /**
+     * @param array<string, mixed> $filters from, to, health
+     */
+    public function summaries(int $batteryId, array $filters, int $perPage): LengthAwarePaginator {
+        $this->getBattery($batteryId);
+
+        return $this->summaryModel->newQuery()
+            ->where('libre_solar_bms_device_id', $batteryId)
+            ->when($filters['from'] ?? null, fn ($q, $v) => $q->where('reported_at', '>=', Carbon::parse($v)))
+            ->when($filters['to'] ?? null, fn ($q, $v) => $q->where('reported_at', '<=', Carbon::parse($v)))
+            ->when($filters['health'] ?? null, fn ($q, $v) => $q->where('health', $v))
+            ->orderByDesc('reported_at')->orderByDesc('id')
+            ->paginate($perPage);
+    }
+
+    /**
+     * Averages per time bucket, oldest first; empty buckets are left out.
+     *
+     * @return list<array<string, mixed>>
+     */
+    public function trend(int $batteryId, Carbon $from, Carbon $to, int $buckets): array {
+        $this->getBattery($batteryId);
+        $span = max(1, (int) abs($to->getTimestamp() - $from->getTimestamp()));
+        $width = max(1, (int) ceil($span / $buckets));
+
+        $rows = $this->summaryModel->newQuery()
+            ->where('libre_solar_bms_device_id', $batteryId)
+            ->whereBetween('reported_at', [$from, $to])
+            ->selectRaw('FLOOR((UNIX_TIMESTAMP(reported_at) - ?) / ?) AS bucket', [$from->getTimestamp(), $width])
+            ->selectRaw('AVG(soc_pct) AS soc_pct, AVG(pack_voltage_v) AS pack_voltage_v, AVG(max_temp_c) AS max_temp_c, AVG(imbalance_v) AS imbalance_v')
+            ->groupBy('bucket')->orderBy('bucket')->get();
+
+        return $rows->map(fn ($r) => [
+            't' => Carbon::createFromTimestamp($from->getTimestamp() + (int) $r->bucket * $width)->toIso8601String(),
+            'soc_pct' => $r->soc_pct === null ? null : round((float) $r->soc_pct, 1),
+            'pack_voltage_v' => $r->pack_voltage_v === null ? null : round((float) $r->pack_voltage_v, 2),
+            'max_temp_c' => $r->max_temp_c === null ? null : round((float) $r->max_temp_c, 1),
+            'imbalance_v' => $r->imbalance_v === null ? null : round((float) $r->imbalance_v, 3),
+        ])->all();
+    }
+
+    /**
+     * @param array<string, mixed> $filters from, to, severity, type
+     */
+    public function events(int $batteryId, array $filters, int $perPage): LengthAwarePaginator {
+        $this->getBattery($batteryId);
+
+        return $this->event->newQuery()
+            ->where('libre_solar_bms_device_id', $batteryId)
+            ->when($filters['from'] ?? null, fn ($q, $v) => $q->where('occurred_at', '>=', Carbon::parse($v)))
+            ->when($filters['to'] ?? null, fn ($q, $v) => $q->where('occurred_at', '<=', Carbon::parse($v)))
+            ->when($filters['severity'] ?? null, fn ($q, $v) => $q->where('severity', $v))
+            ->when($filters['type'] ?? null, fn ($q, $v) => $q->where('type', $v))
+            ->orderByDesc('occurred_at')->orderByDesc('id')
+            ->paginate($perPage);
+    }
+
+    private function findOrRegister(string $deviceId): LibreSolarBmsDevice {
+        return $this->device->newQuery()->firstOrCreate(['device_id' => $deviceId], ['name' => $deviceId]);
+    }
+}
