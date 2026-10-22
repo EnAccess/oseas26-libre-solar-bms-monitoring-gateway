@@ -1,0 +1,104 @@
+# Demo stack: broker, simulated BMS, gateway and Home Assistant.
+#   docker compose up --build -d
+# Home Assistant: http://localhost:8123 (admin / admin, demo only).
+# For real hardware, stop bms-simulator and set SIM_SPEED=1 (see README).
+
+x-gateway-image: &gateway-image
+  build: .
+  image: bms-gateway:local
+
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2.0.20
+    ports:
+      - "${MQTT_PORT:-1883}:1883"
+    volumes:
+      - ./infra/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto-data:/mosquitto/data
+    healthcheck:
+      test: ["CMD", "mosquitto_sub", "-t", "$$SYS/broker/uptime", "-C", "1", "-W", "3"]
+      interval: 5s
+      retries: 10
+    restart: unless-stopped
+
+  bms-simulator:
+    <<: *gateway-image
+    command: ["python", "-m", "bms_gateway.simulator"]
+    environment:
+      MQTT_HOST: mosquitto
+      DEVICE_ID: ${DEVICE_ID:-bms-sim-01}
+      PUBLISH_INTERVAL_S: ${PUBLISH_INTERVAL_S:-5}
+      SIM_SPEED: ${SIM_SPEED:-60}
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    restart: unless-stopped
+
+  gateway:
+    <<: *gateway-image
+    command: ["python", "-m", "bms_gateway.gateway"]
+    environment:
+      MQTT_HOST: mosquitto
+      # 15 min in the field; 1 min in the demo so summaries show up quickly.
+      SUMMARY_INTERVAL_S: ${SUMMARY_INTERVAL_S:-60}
+      # Must equal SIM_SPEED so energy and cycle counts match the simulated time. 1 for real hardware.
+      TIME_SCALE: ${SIM_SPEED:-60}
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Real-hardware path without hardware: `docker compose --profile thingset up -d`
+  # adds a second battery that goes BMS UART (emulated) -> ThingSet -> relay -> MQTT.
+  thingset-emulator:
+    <<: *gateway-image
+    command: ["python", "-m", "bms_gateway.thingset_emulator"]
+    environment:
+      SIM_SPEED: ${SIM_SPEED:-60}
+      THINGSET_CRC: "true"
+    profiles: [thingset]
+    restart: unless-stopped
+
+  relay:
+    <<: *gateway-image
+    command: ["python", "-m", "bms_gateway.relay"]
+    environment:
+      MQTT_HOST: mosquitto
+      DEVICE_ID: ${RELAY_DEVICE_ID:-bms-ts-01}
+      # For a real BMS: serial:/dev/ttyUSB0 (plus a `devices:` entry), and SOURCE_KIND=serial.
+      RELAY_SOURCE: ${RELAY_SOURCE:-tcp://thingset-emulator:3333}
+      SOURCE_KIND: ${SOURCE_KIND:-simulator}
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    profiles: [thingset]
+    restart: unless-stopped
+
+  homeassistant:
+    image: ghcr.io/home-assistant/home-assistant:2026.9.3
+    ports:
+      - "${HA_PORT:-8123}:8123"
+    volumes:
+      - ha-config:/config
+    environment:
+      TZ: ${TZ:-Africa/Kigali}
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    restart: unless-stopped
+
+  ha-setup:
+    <<: *gateway-image
+    command: ["python", "-m", "bms_gateway.ha_setup"]
+    environment:
+      HA_URL: http://homeassistant:8123
+      HA_USERNAME: ${HA_USERNAME:-admin}
+      HA_PASSWORD: ${HA_PASSWORD:-admin}
+      MQTT_HOST: mosquitto
+    depends_on:
+      - homeassistant
+    restart: "no"
+
+volumes:
+  mosquitto-data:
+  ha-config:
